@@ -7,15 +7,18 @@ Repositori ini adalah **fork `Liliya2727/mali-panvk`** (PanVK + kbase) yang dipa
 ## Ringkasan 30 detik
 
 - Tujuan awal: naikkan FPS game DMC4 recomp (`io.github.belmantegu.dmc4recomp`).
-- Driver `malisx2` (repo terpisah di `~/malisx2`) **jalan**: 2 FPS di DMC4. PanVK **tidak jalan**: GPU fault di menu "Press Start".
-- Sudah dicoba dan **gagal**: patch `GROW_ON_GPF`, patch `MEM_JIT_INIT` di JM, hapus shader cache, 4+ versi driver, perbaikan dlopen (`libc++_shared.so`, `__hash_memory`). Fault tetap ada (`TRANSLATION_FAULT`, `JOB_READ_FAULT 0x42`).
-- Kesimpulan: **PanVK v9 JM tidak kompatibel dengan kbase Mediatek di kernel ini**. Jangan mengulang eksperimen yang sama.
-- Rekomendasi: kembali ke `~/malisx2` untuk optimasi.
+- **PanVK v9 JM SEKARANG JALAN TANPA GPU FAULT** di kbase MediaTek kernel 5.10 ini!
+  - Biang keladi `TRANSLATION_FAULT READ` + cascade `JOB_READ_FAULT 0x42` di menu "Press Start" ternyata **bug upstream PanVK v9 JM** di `src/panfrost/vulkan/jm/panvk_vX_cmd_buffer.c`: `cmd_prepare_tiler_context()` lupa mengisi `batch->tiler.ctx.valhall.layer_offset = layer_idx;`, sehingga render pass multi-layer (cubemap 6 layer) membaca polygon list keluar batas pada layer ≥ 1.
+  - Perbaikan tambahan di `kbase_kmod.c`/`.h` + `panvk_vX_gpu_queue.c`: urutan `MEM_EXEC_INIT` sebelum `MEM_JIT_INIT`, cek `BASE_MEM_SAME_VA` saat `exec` BO di-downgrade, `STICKY_RESOURCE_MAP`/`UNMAP` untuk dma-buf import, hapus `SKIP_CACHE_START` (`0x8000`) dari `KBASE_JD_REQ_FRAGMENT`, tambah `dsb st` sebelum `JOB_SUBMIT`, dan `panvk_pool_invalidate_maps()` di `panvk_kbase_report_faults()`.
+- **Perbandingan FPS di DMC4 (180p, menu Press Start):**
+  - **PanVK v7:** 3–5 FPS (0 GPU fault di `dmesg`, tapi compile shader awal di `bi_register_allocate` lambat hingga ~110 detik/shader; setelah masuk `mesa_shader_cache` cuma ~26 ms).
+  - **`malisx2` (repo terpisah di `~/malisx2`):** **10 FPS** di 180p (720p: 2 FPS) berkat compiler **Kraid**.
+- Rekomendasi: untuk optimasi FPS DMC4 tetap lanjut di `~/malisx2`; patch PanVK v9 JM di repo ini sudah bersih dan layak di-commit / di-PR ke upstream.
 
 ## Aturan
 
-- Perubahan di repo ini bersifat **eksperimen**. Patch `kbase_kmod.c` saat ini **tidak memperbaiki masalah** — jangan di-commit sebagai "fix". Kalau mau disimpan, commit sebagai WIP dengan pesan yang jujur.
-- `build-host/`, `build-android/`, `.build-wrappers/`, `subprojects/.wraplock` adalah artefak build Termux. Jangan ikut di-commit.
+- Fix PanVK v9 JM (`panvk_vX_cmd_buffer.c`, `kbase_kmod.c`, `kbase_kmod.h`, `panvk_vX_gpu_queue.c`) sudah teruji 0 GPU fault di Mali-G77 MC9 / MediaTek kernel 5.10.
+- `src/compiler/clc/meson.build`, `src/util/libsync.h`, `build-host/`, `build-android/`, `.build-wrappers/`, `subprojects/.wraplock` adalah artefak/workaround build Termux. Jangan ikut di-commit.
 - `GEMINI.md` dan `AGENTS.md` adalah dokumentasi handoff — boleh di-update kalau ada temuan baru.
 - Jangan menaruh file hasil dekompilasi atau binary Arm di sini.
 - Saat mengganti driver di DMC4, selalu **hapus driver lama** dulu lalu import zip baru, karena `DriverStore` menyimpan status `driver_pending`.
@@ -23,9 +26,9 @@ Repositori ini adalah **fork `Liliya2727/mali-panvk`** (PanVK + kbase) yang dipa
 
 ## Status git saat penulisan
 
+Fix PanVK v9 JM + update dokumentasi sudah di-commit terpisah dari workaround build Termux:
 ```
- M src/compiler/clc/meson.build        build workaround (SPIRV-Tools)
- M src/panfrost/lib/kmod/kbase_kmod.c  eksperimen GPF + JIT (tidak berhasil)
+ M src/compiler/clc/meson.build        build workaround Termux (SPIRV-Tools)
  M src/util/libsync.h                  workaround API 24 untuk host tools
 ?? .build-wrappers/
 ?? subprojects/.wraplock

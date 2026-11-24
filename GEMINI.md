@@ -62,40 +62,46 @@ Saat ini: `measure=off`, `preload_verts=10000`.
   - dispatch ~1.9 ms/submit, vtc ~3.87 ms/submit
 - `preload_verts=0` **tidak mengubah FPS** → jalur ZS-preload bukan pelakunya.
 - Interpretasi: overdraw fragmen; `can_fpk` di `pan_compiler.c:314` butuh shader tanpa `discard`, tanpa tulis depth/stencil, tanpa `outputs_read` → shader DMC4 dengan alpha-test mematikan FPK. **panvk punya syarat FPK yang sama**, jadi fork panvk tidak menyelesaikan ini.
-- FPS malisx2 di DMC4: **2 FPS**. Driver sistem Mali: blackscreen. Driver lain: 0 FPS.
+- FPS malisx2 di DMC4: **2 FPS** (720p), **10 FPS** (180p). PanVK v7: **3–5 FPS** (180p, 0 GPU fault). Driver sistem Mali: blackscreen. Driver lain: 0 FPS.
 
 Zip patch malisx2 untuk DMC4: `/sdcard/malisx2-g77-tune.zip`.
 
 ## 4. Repo `~/mali-panvk` — status & eksperimen
 
-Fork dari **Liliya2727/mali-panvk** (parent `JimVulkan/mali-panvk`), HEAD `58f2c55`, remote push ke `github.com/Liliya2727/mali-panvk.git`.
+Fork dari **Liliya2727/mali-panvk** (parent `JimVulkan/mali-panvk`), remote push ke `github.com/Liliya2727/mali-panvk.git`.
 Clone JimVulkan lama sudah dihapus; folder `mali-panvk-liliya` sudah direname jadi `mali-panvk`.
 
 PanVK = Mesa 27.0.0-devel, Vulkan 1.4, bicara ke `/dev/mali0` (kbase), sudah di-test upstream di G77 (Galaxy S20). Prebuilt release: `/sdcard/mali-panvk-r10.zip`.
 
-### Kronologi kegagalan (jangan diulang)
-1. **Prebuilt r10** — intro video jalan, tapi di "Press Start" 0 FPS. `dmesg`: `Unhandled Page fault ... TRANSLATION_FAULT, READ`, lalu ratusan `JOB_READ_FAULT 0x42`, `panvk: the kbase submission did not complete` → device lost.
-2. **Hipotesis GROW_ON_GPF** — PanVK pakai `ALLOC_ON_FAULT` untuk tiler heap 2×128 MB + poly heap, commit cuma 1 MB, mengandalkan GPU fault untuk commit sisanya. Patch: `grow = false` di `kbase_kmod_bo_alloc` → commit semua halaman (~330 MB). **Tidak menyelesaikan**; fault sama.
-3. **Fix dlopen** (beberapa iterasi):
-   - v1: `.so` butuh `libc++_shared.so` dengan RUNPATH ke Termux → app tidak bisa akses.
-   - v2: ganti NEEDED ke `libc++.so` → error `_ZNSt6__ndk14cerrE`.
-   - v3: kembalikan `libc++_shared.so`, RUNPATH dihapus → error `_ZNSt6__ndk113__hash_memoryEPKvm`.
-   - v4: tambah implementasi lokal `__hash_memory` (`.build-wrappers/hash_shim.cpp/.o`, dimasukkan lewat `cpp_link_args`) → **driver akhirnya ke-load**, intro video jalan, masih fault di menu.
-   - Semua 42 simbol `_ZNSt6__ndk1` sekarang tersedia di `libc++_shared.so` milik game.
-4. **Fix JIT (v5)** — tambah `MEM_JIT_INIT` juga di JM (`group_id=0`, `trim_level=0`), meniru malisx2. Hasil: **black screen sejak awal tapi FPS counter jalan**; fault berubah jadi `TRANSLATION_FAULT EXECUTE` di VA `0x0000000000041B00` (alamat sangat rendah → shader/job chain ngaco).
-5. **Hapus shader cache** (`/data/data/.../cache/mesa_shader_cache`, `.../files/.cache/mesa_shader_cache`) → **tidak ada perubahan**.
-6. **Driver lain yang dicoba:** `Mesa-PanVK-26.3.0-devel-795ca7ff` (universal dari repo Liliya) → blackscreen total. `PanVK-rynx-26.3.1-bionic`, `PanVK_faux123_v1.1.7/1.1.8` tersedia tapi belum semua dicoba tuntas.
-7. Upstream sudah commit terbaru (`58f2c55`), tidak ada fix lebih baru.
+### Kronologi investigasi & penyelesaian
+1. **Prebuilt r10** — intro video jalan, tapi di "Press Start" 0 FPS. `dmesg`: `Unhandled Page fault ... TRANSLATION_FAULT, READ`, lalu ratusan `JOB_READ_FAULT 0x42`, `panvk: the kbase submission did not complete`.
+2. **Hipotesis GROW_ON_GPF** — `grow = false` di `kbase_kmod_bo_alloc` → commit semua halaman (~330 MB). Tidak menyelesaikan fault.
+3. **Fix dlopen (v1–v4)** — tambah shim lokal `__hash_memory` (`.build-wrappers/hash_shim.cpp/.o`, dimasukkan lewat `cpp_link_args`), hapus RUNPATH, NEEDED `libc++_shared.so` → driver berhasil ke-load.
+4. **Regresi JIT (v5)** — memanggil `MEM_JIT_INIT` *sebelum* `MEM_EXEC_INIT` membuat `MEM_EXEC_INIT` gagal, sehingga kbase menurunkan BO shader ke `SAME_VA` dan mengembalikan cookie `0x41000`. Karena `kbase_kmod_bo_alloc` tidak mengecek `req.out.flags & BASE_MEM_SAME_VA`, GPU mencoba mengeksekusi cookie `0x41B00` → black screen.
+5. **Fix kbase + diagnostik fault (v6, `/sdcard/mali-panvk-g77-v6.zip`)**:
+   - Benahi urutan `MEM_EXEC_INIT` sebelum `MEM_JIT_INIT` (dan `MEM_JIT_INIT` hanya untuk CSF) + cek `req.out.flags & BASE_MEM_SAME_VA` di `kbase_kmod_bo_alloc`.
+   - Tambah `STICKY_RESOURCE_MAP`/`UNMAP` di `kbase_kmod_bo_import`/`bo_free`, hapus `SKIP_CACHE_START` (`0x8000`) dari `KBASE_JD_REQ_FRAGMENT` (`0x1u`), tambah `dsb st` sebelum `JOB_SUBMIT`.
+   - Tambah `panvk_pool_invalidate_maps()` di `panvk_kbase_report_faults()` + log `atom_layout` (`V2_FRAME_NR` 64B MediaTek, UK 11.31).
+   - Hasil capture logcat `MESA`: semua batch single-layer (batch 0–20) **sukses**, lalu fault pertama selalu terjadi di **batch 21 & 74** (render pass **6 layer / cubemap**): `job 6` (layer 0) DONE, **`job 7` (layer 1) langsung `TRANSLATION_FAULT READ (0xC2)` di slot 0 (`TERMINATED`)** pada offset identik `...17E80` → memicu cascade `JOB_READ_FAULT 0x42`.
+6. **ROOT CAUSE & FIX (v7, `/sdcard/mali-panvk-g77-v7.zip`)**:
+   - Di `src/panfrost/vulkan/jm/panvk_vX_cmd_buffer.c` (`cmd_prepare_tiler_context`), v9 JM membuat 1 `TILER_CONTEXT` per layer tapi lupa mengisi `batch->tiler.ctx.valhall.layer_offset = layer_idx;` (tetap 0).
+   - Akibatnya `pan_fb.c` menghitung `cfg.internal_layer_index = info->layer - 0 = 1` untuk layer 1 padahal tiler context layer 1 hanya punya 1 layer (index 0) → GPU membaca polygon list keluar batas!
+   - Setelah ditambah `batch->tiler.ctx.valhall.layer_offset = layer_idx;`: **0 GPU fault di `dmesg`**! Game tembus sampai menu Press Start dengan **3–5 FPS di 180p** (catatan: compile shader pertama di `bi_register_allocate` lambat hingga ~110 detik/shader untuk shader besar Xbox360, setelah masuk `mesa_shader_cache` turun jadi ~26 ms).
 
 ### Kesimpulan PanVK
-**PanVK v9 JM tidak kompatibel dengan kbase MediaTek di kernel 5.10 ini.** Bukan masalah flag satu baris. Untuk melanjutkan perlu capture atom + command stream dan melacak BO mana yang tidak di-map — proyek terpisah.
-
-**Rekomendasi:** kembali ke malisx2 untuk optimasi FPS. Patch PanVK yang ada saat ini **tidak menyelesaikan masalah**; jangan di-commit sebagai "fix". Putuskan: revert atau commit sebagai WIP dengan pesan jelas.
+**PanVK v9 JM sekarang BERJALAN BERSIH (0 GPU fault) di kbase MediaTek kernel 5.10 ini.**
+Namun untuk performa DMC4, **`malisx2` (10 FPS @ 180p) masih 2–3× lebih cepat** daripada PanVK v7 (3–5 FPS @ 180p) karena `malisx2` menggunakan compiler **Kraid** (compile jauh lebih cepat dan register spilling lebih rendah dibanding `bi_register_allocate`).
+Catatan opsional: `grow = true` (ALLOC_ON_FAULT) di `kbase_kmod.c` belum diuji ulang setelah fix `valhall.layer_offset` — bisa diuji lagi nanti untuk hemat ~330 MB RAM.
 
 ### File yang dimodifikasi di repo mali-panvk
+Fix yang di-commit:
+- `src/panfrost/vulkan/jm/panvk_vX_cmd_buffer.c` — fix `batch->tiler.ctx.valhall.layer_offset = layer_idx;` untuk multi-layer FBD v9 JM.
+- `src/panfrost/lib/kmod/kbase_kmod.c` + `kbase_kmod.h` — urutan `MEM_EXEC_INIT`, fallback `SAME_VA` untuk `exec` BO, `STICKY_RESOURCE_MAP`/`UNMAP`, `KBASE_JD_REQ_FRAGMENT = 0x1u`, `dsb st`, `grow = false`.
+- `src/panfrost/vulkan/jm/panvk_vX_gpu_queue.c` — `panvk_pool_invalidate_maps()` di `panvk_kbase_report_faults()`.
+
+Workaround build Termux (tetap unstaged, jangan di-commit):
 ```
  M src/compiler/clc/meson.build        SPIRV-Tools PR5534 check → warning (build workaround)
- M src/panfrost/lib/kmod/kbase_kmod.c  patch GROW_ON_GPF + MEM_JIT_INIT (eksperimen, gagal)
  M src/util/libsync.h                  fallback sync_merge/sync_wait API 24 (host tools)
 ?? .build-wrappers/                    cc26/cxx26 (target android30), hash_shim.cpp/.o
 ?? subprojects/.wraplock               lockfile meson
@@ -130,14 +136,13 @@ llvm-strip -o libvulkan_panfrost.so build-android/src/panfrost/vulkan/libvulkan_
 ```
 Jangan pakai `-D__ANDROID_API__=31` (libc++ butuh `pthread_cond_clockwait` yang tidak ada di header Termux). Wrapper target android30 sudah cukup untuk `AHardwareBuffer_isSupported` (API 29) dan `pthread_cond_clockwait` (API 30).
 
-Zip hasil: `/sdcard/mali-panvk-gpf-fix.zip` (versi v5, nama `PanVK Mali G77 kbase JIT fix v5`).
+Zip hasil: `/sdcard/mali-panvk-g77-v7.zip` (versi v7, nama `PanVK Mali G77 v9 layer fix v7`, 0 GPU fault).
 
 ## 5. Langkah berikutnya yang disarankan
 
-1. Kembali ke `~/malisx2`. Putuskan commit atau revert patch yang ada.
-2. Uji render scale game 50% (`controls.xml` / `modkit.xml`, atau UI) — jika FPS naik ~3–4×, terkonfirmasi fill-rate bound.
-3. Jika tetap ingin naikkan FPS lewat driver: port satu fast-path early-Z/FPK dari panvk ke malisx2, atau perbaiki policy preload warna. Jangan fork panvk penuh.
-4. Jika tetap ingin PanVK: perlu capture atom/command stream saat fault dan identifikasi BO yang tidak di-map; ini baru bisa diputuskan setelah data itu ada.
+1. Kembali ke `~/malisx2` untuk optimasi FPS DMC4 (sudah terbukti **10 FPS @ 180p**, 2–3× lebih cepat dari PanVK v7 karena compiler Kraid).
+2. Di `~/malisx2`, profil 180p dengan `debug.malisx2.measure` untuk melihat pass mana yang masih memakan waktu di 180p (apakah pass beresolusi tetap seperti shadow/cubemap, atau overdraw/FPK).
+3. Opsional untuk `~/mali-panvk`: uji ulang `grow = true` (`ALLOC_ON_FAULT`) di `kbase_kmod.c` sekarang setelah bug `valhall.layer_offset` selesai, dan pertimbangkan PR fix `panvk_vX_cmd_buffer.c` ke upstream `Liliya2727/mali-panvk`.
 
 ## 6. Perintah berguna
 
