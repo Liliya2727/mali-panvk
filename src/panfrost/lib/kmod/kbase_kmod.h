@@ -30,7 +30,7 @@ struct pan_kmod_bo;
  * wrong; the numbers below are what the hardware was actually asked for.
  */
 #define KBASE_JD_REQ_VERTEX_TILER 0x4eu
-#define KBASE_JD_REQ_FRAGMENT     0x8001u
+#define KBASE_JD_REQ_FRAGMENT     0x1u
 /* BASE_JD_REQ_PERMON: kbase starts the cycle counter for the atom, which is also what makes the
  * GPU's system timestamp propagate (WRITE_VALUE SYSTEM_TIMESTAMP stores 0 without it). */
 #define KBASE_JD_REQ_PERMON       0x80u

@@ -147,6 +147,15 @@ union kbase_ioctl_mem_import {
    _IOC(_IOC_READ | _IOC_WRITE, KBASE_IOCTL_TYPE, 22, 24)
 #define KBASE_IOCTL_MEM_IMPORT_40                                                                 \
    _IOC(_IOC_READ | _IOC_WRITE, KBASE_IOCTL_TYPE, 22, 40)
+
+struct kbase_ioctl_sticky_resource {
+   uint64_t count;
+   uint64_t address;
+};
+#define KBASE_IOCTL_STICKY_RESOURCE_MAP                                                           \
+   _IOW(KBASE_IOCTL_TYPE, 29, struct kbase_ioctl_sticky_resource)
+#define KBASE_IOCTL_STICKY_RESOURCE_UNMAP                                                         \
+   _IOW(KBASE_IOCTL_TYPE, 30, struct kbase_ioctl_sticky_resource)
 #define BASE_MEM_IMPORT_TYPE_UMM 2
 #define BASE_MEM_SAME_VA         (1ull << 13)
 /* What a SAME_VA import reports back instead of SAME_VA: gpu_va is a cookie to mmap. Measured,
@@ -302,6 +311,7 @@ struct kbase_kmod_bo {
     * the allocation's. NULL for an executable one, whose address comes from the kernel. */
    void *anchor;
    bool exec;
+   bool sticky;
 };
 
 struct kbase_kmod_vm {
@@ -512,27 +522,29 @@ kbase_kmod_dev_create(int fd, uint32_t flags, const struct pan_kmod_allocator *a
          goto err_free_dev;
       }
 
-      /* Reserve the executable VA zone. Without this, an allocation asking for GPU_EX is
-       * silently downgraded to SAME_VA and returns a cookie instead of an address -- silently,
-       * because nothing fails: the allocation succeeds and only the address is wrong. Not fatal
-       * if the kernel refuses it; shader BOs then just live in the ordinary zone. */
+      /* Reserve the executable VA zone first, before any JIT zone or allocation. Without this,
+       * an allocation asking for GPU_EX is silently downgraded to SAME_VA and returns a cookie
+       * instead of an address. Not fatal if the kernel refuses it; kbase_kmod_bo_alloc checks
+       * BASE_MEM_SAME_VA on out.flags and maps the cookie if downgraded. */
       struct kbase_ioctl_mem_exec_init ei = {.va_pages = KBASE_EXEC_ZONE_PAGES};
+      if (pan_kmod_ioctl(fd, KBASE_IOCTL_MEM_EXEC_INIT, &ei))
+         mesa_logw("kbase: MEM_EXEC_INIT failed (err=%d); executable BOs will be SAME_VA", errno);
 
       /* CSF: the kernel's own allocations for this context (tiler heap contexts and chunks)
        * come from the CUSTOM_VA zone, which a 64-bit context only has once JIT is initialised:
-       * kbase carves it out of SAME_VA then. Without it CS_TILER_HEAP_INIT is ENOMEM for any
-       * parameters (measured). It must come before the first allocation. */
+       * kbase carves it out of SAME_VA then. Without it CS_TILER_HEAP_INIT is ENOMEM. */
       if (vc.major == 1) {
          struct kbase_ioctl_mem_jit_init jit = {
             .va_pages = KBASE_CSF_JIT_VA_PAGES,
             .max_allocations = 255,
+            .trim_level = 0,
+            .group_id = 0,
             .phys_pages = KBASE_CSF_JIT_VA_PAGES,
          };
          if (pan_kmod_ioctl(fd, KBASE_IOCTL_MEM_JIT_INIT, &jit))
             mesa_logw("kbase: MEM_JIT_INIT failed (err=%d); no tiler heap", errno);
       }
-      if (pan_kmod_ioctl(fd, KBASE_IOCTL_MEM_EXEC_INIT, &ei))
-         mesa_logw("kbase: MEM_EXEC_INIT failed (err=%d); executable BOs will be SAME_VA", errno);
+      mesa_logi("kbase: context initialized UK %u.%u", vc.major, vc.minor);
    }
 
    const struct pan_kmod_driver drv_info = {
@@ -649,7 +661,13 @@ kbase_kmod_bo_alloc(struct pan_kmod_dev *dev, struct pan_kmod_vm *exclusive_vm, 
       return NULL;
 
    const bool exec = flags & PAN_KMOD_BO_FLAG_EXECUTABLE;
-   const bool grow = !exec && (flags & PAN_KMOD_BO_FLAG_ALLOC_ON_FAULT);
+   /* MediaTek's kbase (mt6893, kernel 5.10) does not service a GPU
+    * grow-on-page-fault: a read of an uncommitted heap page comes back as a
+    * TRANSLATION_FAULT instead of committing the next pages. Commit the
+    * whole BO up front on that kind of kernel. The caller's ALLOC_ON_FAULT
+    * hint is harmless then: it only selects GROW_ON_GPF and the initial
+    * commit below, and both go away when grow is false. */
+   const bool grow = false && !exec && (flags & PAN_KMOD_BO_FLAG_ALLOC_ON_FAULT);
 
    struct kbase_kmod_bo *bo = pan_kmod_dev_alloc(dev, sizeof(*bo));
    if (!bo)
@@ -688,17 +706,19 @@ kbase_kmod_bo_alloc(struct pan_kmod_dev *dev, struct pan_kmod_vm *exclusive_vm, 
       return NULL;
    }
 
-   bo->exec = exec;
+   const bool same_va = (req.out.flags & BASE_MEM_SAME_VA) != 0;
+   bo->exec = !same_va;
    bo->anchor = NULL;
+   bo->sticky = false;
 
-   if (exec) {
+   if (!same_va) {
       /* The exec zone hands back the address itself. Leave the mapping to whoever wants one:
        * this zone allows only a single mmap, so taking an anchor here would spend it. */
       bo->gpu_va = req.out.gpu_va;
    } else {
-      /* req.out.gpu_va is a cookie. Spend it on the anchor, and the address that comes back is
-       * the GPU VA. The anchor is never unmapped before bo_free, because unmapping it frees the
-       * allocation. */
+      /* req.out.gpu_va is a cookie (including when an exec allocation was downgraded to
+       * SAME_VA). Spend it on the anchor, and the address that comes back is the GPU VA. The
+       * anchor is never unmapped before bo_free, because unmapping it frees the allocation. */
       void *anchor = mmap(NULL, pages * 4096, PROT_READ | PROT_WRITE, MAP_SHARED, dev->fd,
                           (off_t)req.out.gpu_va);
       if (anchor == MAP_FAILED) {
@@ -720,6 +740,17 @@ static void
 kbase_kmod_bo_free(struct pan_kmod_bo *bo)
 {
    struct kbase_kmod_bo *kbase_bo = container_of(bo, struct kbase_kmod_bo, base);
+
+   if (kbase_bo->sticky) {
+      uint64_t addr = kbase_bo->gpu_va;
+      struct kbase_ioctl_sticky_resource sr = {
+         .count = 1,
+         .address = (uint64_t)(uintptr_t)&addr,
+      };
+      if (pan_kmod_ioctl(bo->dev->fd, KBASE_IOCTL_STICKY_RESOURCE_UNMAP, &sr))
+         mesa_logw("kbase: STICKY_RESOURCE_UNMAP(0x%" PRIx64 ") failed (err=%d)", kbase_bo->gpu_va,
+                   errno);
+   }
 
    if (kbase_bo->exec) {
       struct kbase_ioctl_mem_free req = {.gpu_addr = kbase_bo->gpu_va};
@@ -824,6 +855,19 @@ kbase_kmod_bo_import(struct pan_kmod_dev *dev, int fd)
    bo->exec = false;
    bo->anchor = anchor;
    bo->gpu_va = (uint64_t)(uintptr_t)anchor;
+   bo->sticky = false;
+
+   {
+      uint64_t addr = bo->gpu_va;
+      struct kbase_ioctl_sticky_resource sr = {
+         .count = 1,
+         .address = (uint64_t)(uintptr_t)&addr,
+      };
+      if (pan_kmod_ioctl(dev->fd, KBASE_IOCTL_STICKY_RESOURCE_MAP, &sr) == 0)
+         bo->sticky = true;
+      else
+         mesa_logw("kbase: STICKY_RESOURCE_MAP(0x%" PRIx64 ") failed (err=%d)", bo->gpu_va, errno);
+   }
    pan_kmod_bo_init(&bo->base, dev, NULL, pages * 4096, PAN_KMOD_BO_FLAG_IMPORTED,
                     p_atomic_inc_return(&kbase_dev->next_handle));
 
@@ -1519,10 +1563,14 @@ kbase_probe_atom_layout(int fd)
       struct kbase_jd_event ev[4];
       const ssize_t n = read(fd, ev, sizeof(ev));
       for (ssize_t i = 0; n > 0 && i < n / (ssize_t)sizeof(ev[0]); i++) {
-         if (ev[i].udata[0] == KBASE_ATOM_PROBE_TAG)
+         if (ev[i].udata[0] == KBASE_ATOM_PROBE_TAG) {
+            mesa_logi("kbase: atom layout probe -> SEQ_NR_FIRST (64B)");
             return KBASE_ATOM_SEQ_NR_FIRST;
-         if (ev[i].udata[1] == KBASE_ATOM_PROBE_TAG)
+         }
+         if (ev[i].udata[1] == KBASE_ATOM_PROBE_TAG) {
+            mesa_logi("kbase: atom layout probe -> V2_FRAME_NR (64B MediaTek)");
             return KBASE_ATOM_V2_FRAME_NR;
+         }
       }
    }
    mesa_logw("kbase: no event for the atom layout probe, assuming seq_nr first");
@@ -1826,6 +1874,12 @@ pan_kmod_kbase_submit_async(struct pan_kmod_dev *dev, const struct pan_kmod_kbas
       .nr_atoms = need,
       .stride = KBASE_ATOM_STRIDE,
    };
+
+#if defined(__aarch64__)
+   __asm__ volatile("dsb st" ::: "memory");
+#else
+   __sync_synchronize();
+#endif
 
    if (pan_kmod_ioctl(dev->fd, KBASE_IOCTL_JOB_SUBMIT, &req)) {
       mesa_loge("kbase: JOB_SUBMIT of %u atoms failed (err=%d)", need, errno);

@@ -80,16 +80,23 @@ static void
 panvk_kbase_report_faults(struct panvk_device *dev, struct panvk_cmd_buffer *const *cmdbufs,
                           unsigned nr_cmdbufs)
 {
+   for (uint32_t j = 0; j < nr_cmdbufs; ++j)
+      panvk_pool_invalidate_maps(&cmdbufs[j]->desc_pool);
    pan_kmod_flush_bo_map_syncs(dev->kmod.dev);
-   unsigned b = 0;
+   unsigned b = 0, logged = 0;
    for (uint32_t j = 0; j < nr_cmdbufs; ++j) {
       list_for_each_entry(struct panvk_batch, batch, &cmdbufs[j]->batches, node) {
          unsigned k = 0;
          util_dynarray_foreach(&batch->jobs, void *, job) {
             const uint32_t *w = *job;
-            mesa_loge("panvk: batch %u job %u: status 0x%x type %u index %u deps %u,%u "
-                      "fault 0x%" PRIx64, b, k, w[0], (w[4] >> 1) & 0x7f, w[4] >> 16,
-                      w[5] & 0xffff, w[5] >> 16, (uint64_t)w[2] | ((uint64_t)w[3] << 32));
+            if (w[0] != 1 && logged < 24) {
+               mesa_loge("panvk: batch %u job %u (vtc=0x%" PRIx64 " frag=0x%" PRIx64 "): "
+                         "status 0x%x type %u index %u deps %u,%u fault 0x%" PRIx64,
+                         b, k, batch->vtc_jc.first_job, batch->frag_jc.first_job, w[0],
+                         (w[4] >> 1) & 0x7f, w[4] >> 16, w[5] & 0xffff, w[5] >> 16,
+                         (uint64_t)w[2] | ((uint64_t)w[3] << 32));
+               logged++;
+            }
             k++;
          }
          b++;
