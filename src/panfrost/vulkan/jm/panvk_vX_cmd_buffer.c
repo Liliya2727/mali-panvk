@@ -400,10 +400,12 @@ panvk_per_arch(cmd_prepare_tiler_context)(struct panvk_cmd_buffer *cmdbuf,
    }
 
 out_set_layer_ctx:
-   if (PAN_ARCH >= 9)
+   if (PAN_ARCH >= 9) {
       batch->tiler.ctx.valhall.desc = tiler_desc;
-   else
+      batch->tiler.ctx.valhall.layer_offset = layer_idx;
+   } else {
       batch->tiler.ctx.bifrost.desc = tiler_desc;
+   }
 
    return VK_SUCCESS;
 }
